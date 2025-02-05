@@ -31,12 +31,14 @@ See : https://huggingface.co/fr-gouv-coordination-ia
 """
 
 import random
+from typing import Callable
 
 import numpy as np
 from aenum import extend_enum
 
 import lighteval.tasks.extended.ifeval.instructions_registry as instructions_registry
 from lighteval.metrics.metrics import Metrics, SampleLevelMetric
+from lighteval.metrics.normalizations import helm_normalizer
 from lighteval.metrics.utils.metric_utils import (
     MetricCategory,
     MetricUseCase,
@@ -47,6 +49,94 @@ from lighteval.tasks.extended.ifeval.main import ifeval_metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
 from lighteval.utils.utils import as_list
+
+
+# custom Metric
+class PrefixSuffixExactMatch:
+    def __init__(
+        self,
+        aggregation_function: Callable[[list[float]], float] = max,
+        normalize_gold: Callable[[str], str] | None = None,
+        normalize_pred: Callable[[str], str] | None = None,
+        strip_strings: bool = True,
+    ):
+        """An exact match class.
+
+        Args:
+            aggregation_function (callable, optional): How to aggregate the item results. Defaults to max.
+                Used if there are several golds or predictions on which scores were computed.
+            normalize_gold (callable, optional): Function to use to normalize the reference strings.
+                Defaults to None if no normalization is applied.
+            normalize_pred (callable, optional): Function to use to normalize the predicted strings.
+                Defaults to None if no normalization is applied.
+        """
+        self.aggregation_function = aggregation_function
+        self.normalize_gold = normalize_gold
+        self.normalize_pred = normalize_pred
+        self.strip_strings = strip_strings
+
+    def compute(self, golds: list[str], predictions: list[str], **kwargs) -> float:
+        """Computes the metric over a list of golds and predictions for one single sample.
+
+        Args:
+            golds (list[str]): Reference targets
+            predictions (list[str]): Predicted strings
+
+        Returns:
+            float: Aggregated score over the current sample's items.
+        """
+        results = []
+        # We might need to flatten golds if they are a list of lists
+        for gold in golds:
+            for pred in predictions:
+                results.append(self.compute_one_item(gold=gold, pred=pred))
+        return self.aggregation_function(results)
+
+    def compute_one_item(
+        self,
+        gold: str,
+        pred: str,
+    ) -> float:
+        """Compares two strings only.
+
+        Args:
+            gold (str): One of the possible references
+            pred (str): One of the possible predictions
+
+        Returns:
+            float: The exact match score. Will be 1 for a match, 0 otherwise.
+        """
+        if not pred:
+            return 0
+
+        if self.strip_strings:
+            gold = gold.strip()
+            pred = pred.strip()
+
+        if self.normalize_gold:
+            gold = self.normalize_gold(gold)
+        if self.normalize_pred:
+            pred = self.normalize_pred(pred)
+
+        if pred.startswith(gold):  # prefix em
+            return 1
+        if pred.endswith(gold):  # suffix em
+            return 1
+        return 1 if gold == pred else 0  # strict em
+
+
+prefixsuffix_quasi_exact_match = SampleLevelMetric(
+    metric_name="psqem",
+    sample_level_fn=PrefixSuffixExactMatch(
+        normalize_gold=helm_normalizer,
+        normalize_pred=helm_normalizer,
+        strip_strings=True,
+    ).compute,
+    category=MetricCategory.GENERATIVE,
+    use_case=MetricUseCase.ACCURACY,
+    corpus_level_fn=np.mean,
+    higher_is_better=True,
+)
 
 
 # Ifeval-fr prompt function
@@ -83,14 +173,17 @@ def prompt_gpqa_fr(line, task_name: str = None):
 
 # BAC-fr prompt function
 def prompt_bac_fr(line, task_name: str = None):
-    prompt = f"Enoncé: {line['enonce']}\n{line['instruction']}\n"
+    prompt = f"Enoncé: {line['enonce']}\n"
+    if line["instruction"] is not None:
+        prompt += f"{line['instruction']}\n"
+    prompt += "Réponse: "
     if line["choix"] is not None:  # Multichoice evaluation
         # prompt += "\n".join([f"{LETTER_INDICES[ix]}.{choix}" for ix, choix in enumerate(line["choix"])])
         return Doc(
             task_name=task_name,
             query=prompt,
             choices=as_list(line["choix"]),
-            gold_index=line["choix"].index(line["choix correct"]),
+            gold_index=as_list(line["choix"]).index(line["choix correct"]),
             instruction="",
         )
     else:
@@ -145,8 +238,8 @@ bac_fr_task = LightevalTaskConfig(
     evaluation_splits=["train"],
     few_shots_split=None,
     few_shots_select="random_sampling",
-    generation_size=1,
-    metric=[Metrics.quasi_exact_match_math, Metrics.exact_match],
+    generation_size=100,
+    metric=[Metrics.quasi_exact_match, prefixsuffix_quasi_exact_match],
     stop_sequence=["\n"],
     trust_dataset=True,
     version=0,
