@@ -93,6 +93,7 @@ class VLLMModelConfig:
     )
     pairwise_tokenization: bool = False  # whether to tokenize the context and continuation separately or together.
     generation_parameters: GenerationParameters = None  # sampling parameters to use for generation
+    enforce_eager: bool = False  # whether or not to disable cuda graphs with vllm
 
     subfolder: Optional[str] = None
 
@@ -111,6 +112,7 @@ class VLLMModel(LightevalModel):
         self._config = config
         self.use_chat_template = config.use_chat_template
         self.data_parallel_size = int(config.data_parallel_size)
+        self.tensor_parallel_size = int(config.tensor_parallel_size)
 
         self._add_special_tokens = config.add_special_tokens if config.add_special_tokens is not None else False
         self._tokenizer = self._create_auto_tokenizer(config, env_config)
@@ -136,13 +138,19 @@ class VLLMModel(LightevalModel):
         return self._tokenizer
 
     def cleanup(self):
-        destroy_model_parallel()
+        if ray is not None:
+            ray.get(ray.remote(destroy_model_parallel).remote())
+        else:
+            destroy_model_parallel()
         if self.model is not None:
             del self.model.llm_engine.model_executor.driver_worker
         self.model = None
         gc.collect()
         ray.shutdown()
-        destroy_distributed_environment()
+        if ray is not None:
+            ray.get(ray.remote(destroy_distributed_environment).remote())
+        else:
+            destroy_distributed_environment()
         torch.cuda.empty_cache()
 
     @property
@@ -182,9 +190,10 @@ class VLLMModel(LightevalModel):
             "max_model_len": self._max_length,
             "swap_space": 4,
             "seed": 1234,
+            "enforce_eager": config.enforce_eager,
         }
         if int(config.data_parallel_size) > 1:
-            self.model_args["worker_use_ray"] = True
+            self.model_args["distributed_executor_backend"] = "ray"
             self._batch_size = "auto"
             return None
 
@@ -331,7 +340,9 @@ class VLLMModel(LightevalModel):
             # see https://github.com/vllm-project/vllm/issues/973
             # note: this has changed on 0.3.3, and it only works now if num_gpus are set.
             # but then tensor_parallel breaks
-            @ray.remote
+            # Hynek: With the newest vllm, it actually breaks when tensor_parallel_size == 1 and num_gpus not set,
+            # as VLLM complains about no GPUs available.
+            @ray.remote(num_gpus=1 if self.tensor_parallel_size == 1 else None)
             def run_inference_one_model(model_args: dict, sampling_params: SamplingParams, requests):
                 llm = LLM(**model_args)
                 return llm.generate(prompt_token_ids=requests, sampling_params=sampling_params)
